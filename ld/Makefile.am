@@ -279,6 +279,7 @@ ALL_EMULATION_SOURCES = \
 	eelf_i386.c \
 	eelf_i386_be.c \
 	eelf_i386_fbsd.c \
+	eelf_i386_fennix.c \
 	eelf_i386_haiku.c \
 	eelf_i386_ldso.c \
 	eelf_i386_sol2.c \
@@ -463,6 +464,7 @@ ALL_64_EMULATION_SOURCES = \
 	eelf_x86_64.c \
 	eelf_x86_64_cloudabi.c \
 	eelf_x86_64_fbsd.c \
+	eelf_x86_64_fennix.c \
 	eelf_x86_64_haiku.c \
 	eelf_x86_64_sol2.c \
 	ehppa64linux.c \
