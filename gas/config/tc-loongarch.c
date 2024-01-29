@@ -71,7 +71,17 @@ struct loongarch_cl_insn
   long where;
   /* The relocs associated with the instruction, if any.  */
   fixS *fixp[MAX_RELOC_NUMBER_A_INSN];
-  long macro_id;
+  /* Represents macros or instructions expanded from macro.
+     For la.local -> la.pcrel or la.pcrel -> pcalau12i + addi.d, la.pcrel,
+     pcalau12i and addi.d are expanded from macro.
+     The first bit represents expanded from one register macro (e.g.
+     la.local $t0, symbol) and emit R_LARCH_RELAX relocations.
+     The second bit represents expanded from two registers macro (e.g.
+     la.local $t0, $t1, symbol) and not emit R_LARCH_RELAX relocations.
+
+     The macros or instructions expanded from macros do not output register
+     deprecated warning.  */
+  unsigned int expand_from_macro;
 };
 
 #ifndef DEFAULT_ARCH
@@ -306,8 +316,11 @@ loongarch_after_parse_args ()
   /* Init ilp32/lp64 registers alias.  */
   r_abi_names = loongarch_r_alias;
   for (i = 0; i < ARRAY_SIZE (loongarch_r_alias); i++)
-    str_hash_insert (r_htab, loongarch_r_alias[i], (void *) (i + 1),
-	0);
+    str_hash_insert (r_htab, loongarch_r_alias[i], (void *) (i + 1), 0);
+
+  for (i = 0; i < ARRAY_SIZE (loongarch_r_alias_1); i++)
+    str_hash_insert (r_htab, loongarch_r_alias_1[i], (void *) (i + 1), 0);
+
   for (i = 0; i < ARRAY_SIZE (loongarch_r_alias_deprecated); i++)
     str_hash_insert (r_deprecated_htab, loongarch_r_alias_deprecated[i],
 	(void *) (i + 1), 0);
@@ -426,18 +439,6 @@ loongarch_mach (void)
 
 static const expressionS const_0 = { .X_op = O_constant, .X_add_number = 0 };
 
-static void
-s_loongarch_align (int arg)
-{
-  const char *t = input_line_pointer;
-  while (!is_end_of_line[(unsigned char) *t] && *t != ',')
-    ++t;
-  if (*t == ',')
-    s_align_ptwo (arg);
-  else
-    s_align_ptwo (0);
-}
-
 /* Handle the .dtprelword and .dtpreldword pseudo-ops.  They generate
    a 32-bit or 64-bit DTP-relative relocation (BYTES says which) for
    use in DWARF debug information.  */
@@ -469,7 +470,6 @@ s_dtprel (int bytes)
 
 static const pseudo_typeS loongarch_pseudo_table[] =
 {
-  { "align", s_loongarch_align, -4 },
   { "dword", cons, 8 },
   { "word", cons, 4 },
   { "half", cons, 2 },
@@ -722,7 +722,10 @@ loongarch_args_parser_can_match_arg_helper (char esc_ch1, char esc_ch2,
 		  ip->reloc_info[ip->reloc_num].value = const_0;
 		  ip->reloc_num++;
 		}
-	      if (LARCH_opts.relax && ip->macro_id
+
+	      /* Only one register macros (used in normal code model)
+		 emit R_LARCH_RELAX.  */
+	      if (LARCH_opts.relax && (ip->expand_from_macro & 1)
 		    && (BFD_RELOC_LARCH_PCALA_HI20 == reloc_type
 			|| BFD_RELOC_LARCH_PCALA_LO12 == reloc_type
 			|| BFD_RELOC_LARCH_GOT_PC_HI20 == reloc_type
@@ -754,7 +757,9 @@ loongarch_args_parser_can_match_arg_helper (char esc_ch1, char esc_ch2,
       imm = (intptr_t) str_hash_find (r_deprecated_htab, arg);
       ip->match_now = 0 < imm;
       ret = imm - 1;
-      if (ip->match_now && !ip->macro_id)
+      /* !ip->expand_from_macro: avoiding duplicate output warnings,
+	 only the first macro output warning.  */
+      if (ip->match_now && !ip->expand_from_macro)
 	as_warn (_("register alias %s is deprecated, use %s instead"),
 		 arg, r_abi_names[ret]);
       break;
@@ -773,7 +778,7 @@ loongarch_args_parser_can_match_arg_helper (char esc_ch1, char esc_ch2,
 	}
       ip->match_now = 0 < imm;
       ret = imm - 1;
-      if (ip->match_now && !ip->macro_id)
+      if (ip->match_now && !ip->expand_from_macro)
 	break;
       /* Handle potential usage of deprecated register aliases.  */
       imm = (intptr_t) str_hash_find (f_deprecated_htab, arg);
@@ -1068,13 +1073,22 @@ append_fixp_and_insn (struct loongarch_cl_insn *ip)
      optimized away or compressed by the linker during relaxation, to prevent
      the assembler from computing static offsets across such an instruction.
 
-     This is necessary to get correct .eh_frame cfa info. If one cfa's two
-     symbol is not in the same frag, it will generate relocs to calculate
-     symbol subtraction. (gas/dw2gencfi.c:output_cfi_insn:
-     if (symbol_get_frag (to) == symbol_get_frag (from)))  */
+     This is necessary to get correct .eh_frame FDE DW_CFA_advance_loc info.
+     If one cfi_insn_data's two symbols are not in the same frag, it will
+     generate ADD and SUB relocations pairs to calculate DW_CFA_advance_loc.
+     (gas/dw2gencfi.c: output_cfi_insn:
+     if (symbol_get_frag (to) == symbol_get_frag (from)))
+
+     For macro instructions, only the first instruction expanded from macro
+     need to start a new frag.  */
   if (LARCH_opts.relax
       && (BFD_RELOC_LARCH_PCALA_HI20 == reloc_info[0].type
-	  || BFD_RELOC_LARCH_GOT_PC_HI20 == reloc_info[0].type))
+	  || BFD_RELOC_LARCH_GOT_PC_HI20 == reloc_info[0].type
+	  || BFD_RELOC_LARCH_TLS_LE_HI20_R == reloc_info[0].type
+	  || BFD_RELOC_LARCH_TLS_LE_ADD_R == reloc_info[0].type
+	  || BFD_RELOC_LARCH_TLS_LD_PC_HI20 == reloc_info[0].type
+	  || BFD_RELOC_LARCH_TLS_GD_PC_HI20 == reloc_info[0].type
+	  || BFD_RELOC_LARCH_TLS_DESC_PC_HI20 == reloc_info[0].type))
     {
       frag_wane (frag_now);
       frag_new (0);
@@ -1172,7 +1186,7 @@ assember_macro_helper (const char *const args[], void *context_ptr)
  * assuming 'not starting with space and not ending with space' or pass in
  * empty c_str.  */
 static void
-loongarch_assemble_INSNs (char *str, struct loongarch_cl_insn *ctx)
+loongarch_assemble_INSNs (char *str, unsigned int expand_from_macro)
 {
   char *rest;
   size_t len_str = strlen(str);
@@ -1195,7 +1209,7 @@ loongarch_assemble_INSNs (char *str, struct loongarch_cl_insn *ctx)
 
       struct loongarch_cl_insn the_one = { 0 };
       the_one.name = str;
-      the_one.macro_id = ctx->macro_id;
+      the_one.expand_from_macro = expand_from_macro;
 
       for (; *str && *str != ' '; str++)
 	;
@@ -1217,29 +1231,37 @@ loongarch_assemble_INSNs (char *str, struct loongarch_cl_insn *ctx)
 	break;
 
       append_fixp_and_insn (&the_one);
+
+      /* Expanding macro instructions.  */
       if (the_one.insn_length == 0 && the_one.insn->macro)
 	{
-	  the_one.macro_id = 1;
+	  unsigned int new_expand_from_macro = 0;
+	  if (2 == the_one.arg_num)
+	    new_expand_from_macro |= 1;
+	  else if (3 == the_one.arg_num)
+	    new_expand_from_macro |= 2;
 
 	  char *c_str = loongarch_expand_macro (the_one.insn->macro,
 						the_one.arg_strs,
 						assember_macro_helper,
 						&the_one, len_str);
-	  loongarch_assemble_INSNs (c_str, &the_one);
+	  /* The first instruction expanded from macro.  */
+	  loongarch_assemble_INSNs (c_str, new_expand_from_macro);
 	  free (c_str);
 	}
     }
   while (0);
 
+  /* The rest instructions expanded from macro, split by semicolon(;),
+     assembly one by one.  */
   if (*rest != '\0')
-    loongarch_assemble_INSNs (rest, ctx);
+    loongarch_assemble_INSNs (rest, expand_from_macro);
 }
 
 void
 md_assemble (char *str)
 {
-  struct loongarch_cl_insn the_one = { 0 };
-  loongarch_assemble_INSNs (str, &the_one);
+  loongarch_assemble_INSNs (str, 0);
 }
 
 const char *
