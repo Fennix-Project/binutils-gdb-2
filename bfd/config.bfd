@@ -1507,6 +1507,7 @@ case "${targ}" in
     targ_selvecs=
     targ64_selvecs=x86_64_elf64_vec
     ;;
+
 #ifdef BFD64
   x86_64-*-fennix*)
     targ_defvec=x86_64_elf64_vec
